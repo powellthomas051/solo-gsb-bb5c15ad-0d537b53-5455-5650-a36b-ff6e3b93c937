@@ -29,7 +29,12 @@
 索引与 0/1 绑综值后复用同一审计流程入库——导出再导入保持交织矩阵与审计
 结果完全一致。此外可通过 `POST /designs/{id}/tags` 为已入库设计维护
 **去重的简体中文标签**，`GET /designs/{id}/tags` 按首次添加顺序查询
-标签。
+标签。还可对 1～50 个已入库设计做**设计归档**：`POST /design-archives`
+按 ID 升序读取每份设计的参数与审计结果，生成规范化 JSON 清单（canonical
+JSON）并计算 SHA-256 digest 持久化，**相同 digest 幂等复用**（同一组
+设计反复提交只产生一条归档记录）；`GET /design-archives/{id}/verify`
+按归档时的设计集合重新读取、重建清单并重算 digest，报告 digest 是否一致、
+哪些设计已缺失，以及归档清单与重算清单的首个差异路径。
 
 ## 快速启动
 
@@ -99,7 +104,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `PORT` | `8000` | 服务监听端口（Compose 中映射为主机 `8000:8000`） |
 | `DATABASE_PATH` | 容器内 `/data/weave.db`，本地 `data/weave.db` | SQLite 数据库文件路径；Compose 已挂载卷 `weave-data` 持久化 |
 
-数据库表（`designs`、`audits`、`design_tags`）在服务启动时自动创建，
+数据库表（`designs`、`audits`、`design_tags`、`design_archives`）在服务启动时自动创建，
 无需手工迁移。
 
 ## 数据模型与约定
@@ -153,6 +158,8 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `GET` | `/designs/{id}/float-risk-zones` | 风险区域聚合：把已存违规展开为矩阵单元并按经纬相邻合并，按严重度降序返回区域列表与总数 |
 | `GET` | `/designs/{id}/wif` | WIF 1.1 导出：固定段落、1 基索引的 `text/plain` 文本（含 threading/tie_up/treadling/cyclic/max_float） |
 | `POST` | `/designs/import-wif` | WIF 1.1 导入：解析同格式 `[WIF]`/`[CONTENTS]`/`[WEAVING]` 等段落，校验后复用同一审计流程入库（201）；解析失败 400 且不写库 |
+| `POST` | `/design-archives` | 设计归档：1～50 个已入库 ID 按升序读取、生成规范化 JSON 清单与 SHA-256 digest 并持久化；相同 digest 幂等复用（新建 201 / 复用 200） |
+| `GET` | `/design-archives/{id}/verify` | 归档核验：重新读取设计、重建清单、重算 digest，报告一致性、缺失设计与首个差异路径；归档不存在 404 |
 | `GET` | `/health` | 健康检查 |
 
 ### 示例：提交设计
@@ -888,6 +895,148 @@ curl -s -X POST http://localhost:8000/designs/import-wif \
 {"detail": "warp end 3 references shaft 5 out of range: valid index is [1, 4]"}
 ```
 
+### 设计归档（design-archives）
+
+`POST http://localhost:8000/design-archives`：接收 **1～50 个已入库设计
+ID**（正整数、不重复；顺序无关），服务端按 ID **升序**逐份读取设计参数
+（name/cyclic/max_float/综框踏板/穿综/绑综/踏综/尺寸）与**入库时的审计
+结果**（exceeds/interlacing/violations），生成一份**规范化 JSON 清单**
+并计算 SHA-256 digest，随后同事务持久化。
+
+**规范化清单（canonical JSON）结构**：
+
+```json
+{
+  "schema": "design-archive/v1",
+  "item_count": 2,
+  "designs": {
+    "1": {
+      "name": "2/2 twill", "cyclic": true, "max_float": 2,
+      "shafts": 4, "treadles": 4, "warp_ends": 8, "weft_picks": 8,
+      "threading": [0, 1, 2, 3, 0, 1, 2, 3],
+      "tie_up": [[1,1,0,0],[0,1,1,0],[0,0,1,1],[1,0,0,1]],
+      "treadling": [0, 1, 2, 3, 0, 1, 2, 3],
+      "audit": {"exceeds": false, "interlacing": [["..."]], "violations": []}
+    },
+    "2": {"...": "另一份设计的同构快照"}
+  }
+}
+```
+
+规范化与 digest 规则：
+
+- 清单内容**只取决于 ID 集合与入库内容**：服务端统一按 ID 升序处理，
+  乱序提交、调换提交顺序都得到同一份清单；
+- 每个设计项是 `GET /designs/{id}` 响应的**参数 + audit 快照**，刻意
+  不含 `id`（已体现在 `designs` 的键上）与 `created_at`（入库元数据，
+  不属于设计内容）；
+- digest 的计算输入固定为
+  `json.dumps(manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":"))`
+  再追加一个换行（`\n`）的 UTF-8 字节，digest =
+  `sha256(...).hexdigest()`（64 位小写十六进制）。键排序 + 紧凑分隔符
+  保证任意语言/时间重新序列化都得到相同字节，因此**相同 digest 必然
+  幂等复用**。
+
+响应与状态码：
+
+| 情形 | 状态码 | 说明 |
+| --- | --- | --- |
+| 该 digest 首次出现 | **201** | 新建归档，`reused=false` |
+| 相同 digest 已存在 | **200** | 直接复用原记录，`reused=true`，`id`/`created_at`/清单均不变，不新增行 |
+| 存在未入库的 ID | **404** | `detail` 指向最小缺失 ID，响应体另含升序的 `missing_design_ids`；整次归档失败，**不产生任何归档记录** |
+| 列表为空 / 超 50 个 / 有重复 ID / 含非正整数 / 缺字段 / 类型错 | **422** | Pydantic 框架校验 |
+
+`digest` 列在 SQLite 中有 `UNIQUE` 约束兜底：并发提交相同 ID 集合时，
+落败的 INSERT 随事务整体回滚并自动转为复用已存记录，同样不会留下半成品。
+
+```bash
+# 归档两份设计（顺序无所谓）
+curl -s -X POST http://localhost:8000/design-archives \
+  -H 'Content-Type: application/json' \
+  -d '{"design_ids": [2, 1]}'
+```
+
+响应（201，首次；再次提交同一 ID 集合时为 200 且 `reused=true`）：
+
+```json
+{
+  "id": 1,
+  "digest": "f7c2aed08518f7648158d35808312bbe8745fd6a0c17be8288f3793bb2a83393",
+  "reused": false,
+  "created_at": "2026-09-23T00:00:00Z",
+  "design_ids": [1, 2],
+  "item_count": 2,
+  "manifest": {"schema": "design-archive/v1", "item_count": 2, "designs": {"...": "..."}}
+}
+```
+
+不存在的设计 ID（注意缺失列表始终升序）：
+
+```json
+{"detail": "design 7 not found", "missing_design_ids": [7, 9]}
+```
+
+`GET http://localhost:8000/design-archives/{id}/verify`：**只读核验**，
+不改动归档与原设计。服务按归档记录中的 ID 列表重新从库中读取设计、
+重建规范化清单并重算 SHA-256 digest，与归档时持久化的内容逐项比对：
+
+| 字段 | 说明 |
+| --- | --- |
+| `digest` | 归档时持久化的 digest |
+| `recomputed_digest` | 按**当前库中**数据重建清单重算的 digest；有设计缺失、无法完整重建时为 `null` |
+| `digest_match` | 是否一致：重算 digest 等于归档 digest，**且**归档清单自身重算 digest 与 digest 列相符（可发现清单/digest 列被单独篡改）；有缺失时恒为 `false` |
+| `missing_design_ids` | 归档覆盖、但当前库中已读不到的设计 ID（升序） |
+| `first_diff_path` | 归档清单与重算清单**首个差异**的点分路径：对象字段用 `.`（如 `designs.2.audit.exceeds`），数组元素用 `[i]`（如 `designs.1.audit.interlacing[3][0]`）；缺失设计为 `designs.<id> (design missing from store)`；无差异为 `null`。差异按清单键排序深度优先定位，因此多个差异时报告 ID 最小、字段最靠前的一个 |
+| `verified_at` | 核验时间（UTC，ISO 8601） |
+
+```bash
+curl -s http://localhost:8000/design-archives/1/verify
+```
+
+归档完好时：
+
+```json
+{
+  "id": 1,
+  "digest": "f7c2aed0...",
+  "recomputed_digest": "f7c2aed0...",
+  "digest_match": true,
+  "missing_design_ids": [],
+  "first_diff_path": null,
+  "verified_at": "2026-09-23T00:00:01Z"
+}
+```
+
+设计 2 的审计结果与归档不一致时：
+
+```json
+{
+  "id": 1,
+  "digest": "f7c2aed0...",
+  "recomputed_digest": "9ab0...",
+  "digest_match": false,
+  "missing_design_ids": [],
+  "first_diff_path": "designs.2.audit.interlacing[1][2]",
+  "verified_at": "2026-09-23T00:00:01Z"
+}
+```
+
+归档中的设计 1 已从库中缺失时：
+
+```json
+{
+  "id": 1,
+  "digest": "f7c2aed0...",
+  "recomputed_digest": null,
+  "digest_match": false,
+  "missing_design_ids": [1],
+  "first_diff_path": "designs.1 (design missing from store)",
+  "verified_at": "2026-09-23T00:00:01Z"
+}
+```
+
+归档 ID 不存在返回 404：`{"detail": "design archive 999 not found"}`。
+
 ### 拒绝情形（HTTP 400，整份设计不入库）
 
 - 绑综矩阵非矩形（各行长度不一致）或含非 0/1 值；
@@ -916,6 +1065,8 @@ python3 tests/test_api_loom_fit.py           # loom-fit 接口集成测试
 python3 tests/test_api_float_risk_zones.py   # float-risk-zones 接口集成测试
 python3 tests/test_api_tags.py               # tags 新增/查询接口集成测试
 python3 tests/test_api_wif.py                # WIF 导出/导入接口集成测试
+python3 tests/test_api_design_archives.py    # 设计归档/幂等复用/核验接口集成测试
+python3 tests/smoke_design_archives.py       # 归档接口端到端冒烟（需先启动服务，仅用标准库）
 ```
 
 接口测试使用临时 SQLite 文件与 FastAPI TestClient，不需要启动服务，也不会
@@ -929,15 +1080,37 @@ docker run --rm -v "$PWD":/app -w /app weave-audit \
   sh -c 'python3 tests/test_weave.py && python3 tests/test_api_wif.py'
 ```
 
+**Docker 启动后的归档接口端到端测试**（`tests/smoke_design_archives.py`
+仅依赖 Python 标准库，直接向运行中的服务发 HTTP 请求，可在容器内执行）：
+
+```bash
+# 启动服务
+docker compose up --build -d
+
+# 方式一：在宿主机直接运行（映射端口为 8000；脚本仅需 python3 标准库）
+python3 tests/smoke_design_archives.py
+#   自定义地址：
+#   BASE_URL=http://localhost:8000 python3 tests/smoke_design_archives.py
+
+# 方式二：复用已构建镜像、挂载仓库，在一次性容器内访问宿主映射端口
+docker run --rm --network host -v "$PWD":/app -w /app weave-audit \
+  python3 tests/smoke_design_archives.py http://localhost:8000
+```
+
+冒烟脚本完整走查：建两份设计 → 逆序归档（201）→ 同 ID 集合复用（200，
+id/digest 不变）→ 不同子集另建归档（201）→ verify 一致 → 缺失 ID 404 →
+重复/超量 ID 422 → 未知归档核验 404。
+
 ## 项目结构
 
 ```
 app/
-  main.py    # FastAPI 路由与启动钩子（启动时建表）
-  weave.py   # 交织矩阵生成与浮长审计核心逻辑
-  wif.py     # WIF 1.1 固定段落纯文本的导出序列化与导入解析
-  db.py      # SQLite 持久层
-  models.py  # Pydantic 请求/响应模型
+  main.py       # FastAPI 路由与启动钩子（启动时建表）
+  weave.py      # 交织矩阵生成与浮长审计核心逻辑
+  wif.py        # WIF 1.1 固定段落纯文本的导出序列化与导入解析
+  archives.py   # 设计归档：规范化 JSON 清单、SHA-256 digest、幂等创建与核验比对
+  db.py         # SQLite 持久层（含 design_archives 归档表）
+  models.py     # Pydantic 请求/响应模型（含 1～50/去重/正整数校验）
 tests/
   test_weave.py                   # 核心逻辑单元测试：python3 tests/test_weave.py
   test_api_repeat_period.py       # repeat-period 接口集成测试（TestClient，临时库）
@@ -948,6 +1121,8 @@ tests/
   test_api_float_risk_zones.py    # float-risk-zones 接口集成测试（TestClient，临时库）
   test_api_tags.py                # tags 新增/查询接口集成测试（TestClient，临时库）
   test_api_wif.py                 # WIF 导出/导入接口集成测试（TestClient，临时库）
+  test_api_design_archives.py     # 归档创建/幂等复用/核验接口集成测试（TestClient，临时库）
+  smoke_design_archives.py        # 归档接口端到端冒烟：对运行中的服务发 HTTP 请求（仅标准库）
 Dockerfile
 docker-compose.yml
 requirements.txt

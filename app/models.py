@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class DesignIn(BaseModel):
@@ -304,6 +304,140 @@ class DesignCompareIn(BaseModel):
 
     other_design_id: int = Field(
         ..., ge=1, description="参与比对的另一份已入库设计 ID"
+    )
+
+
+ARCHIVE_MIN_ITEMS = 1
+ARCHIVE_MAX_ITEMS = 50
+
+
+class DesignArchiveIn(BaseModel):
+    """设计归档请求：1～50 个**已入库**设计 ID。
+
+    ID 按 1～50 个、正整数、不重复校验（框架层，失败返回 422）；ID 是否
+    真实存在在归档事务内检查，缺失返回 404。服务端统一按 ID 升序读取并
+    构造清单，因此提交顺序不影响 digest。
+    """
+
+    design_ids: list[Annotated[int, Field(ge=1)]] = Field(
+        ...,
+        min_length=ARCHIVE_MIN_ITEMS,
+        max_length=ARCHIVE_MAX_ITEMS,
+        description="待归档的已入库设计 ID 列表，1～50 个、正整数、不重复；"
+        "顺序无关，服务端按 ID 升序处理",
+    )
+
+    @field_validator("design_ids")
+    @classmethod
+    def _validate_design_ids(cls, value: list[int]) -> list[int]:
+        # 非正整数已由 ge=1 框架校验拦截；这里补充去重校验以给出明确错误
+        duplicates = sorted({i for i in value if value.count(i) > 1})
+        if duplicates:
+            raise ValueError(
+                f"design_ids must not contain duplicates: {duplicates}"
+            )
+        return value
+
+
+class ArchiveViolationOut(Violation):
+    """归档清单中的一条浮长违规（字段同审计结果）。"""
+
+
+class ArchiveAuditOut(BaseModel):
+    """归档清单中单个设计的审计结果快照。"""
+
+    exceeds: bool = Field(..., description="入库时是否存在超过 max_float 的浮长")
+    interlacing: list[list[int]] = Field(
+        ..., description="入库时的经纬交织矩阵，1=经纱在上，0=纬纱在上"
+    )
+    violations: list[ArchiveViolationOut] = Field(
+        ..., description="入库时的浮长违规记录"
+    )
+
+
+class ArchiveDesignItemOut(BaseModel):
+    """归档清单中单个设计的参数与审计结果快照（不含 id、created_at）。"""
+
+    name: str | None = Field(..., description="设计名称（可选）")
+    cyclic: bool = Field(..., description="设计入库时声明的循环标记")
+    max_float: int = Field(..., description="设计入库时声明的最大浮长阈值")
+    shafts: int = Field(..., description="综框数（tie_up 列数）")
+    treadles: int = Field(..., description="踏板数（tie_up 行数）")
+    warp_ends: int = Field(..., description="经纱数（交织矩阵列数）")
+    weft_picks: int = Field(..., description="纬纱数（交织矩阵行数）")
+    threading: list[int] = Field(..., description="穿综映射（0 基）")
+    tie_up: list[list[int]] = Field(..., description="绑综矩阵（0/1）")
+    treadling: list[int] = Field(..., description="踏综序列（0 基）")
+    audit: ArchiveAuditOut = Field(..., description="该设计入库时的审计结果")
+
+
+class DesignArchiveManifestOut(BaseModel):
+    """规范化归档清单。"""
+
+    # "schema" 与 Pydantic 内部遗留方法同名，用别名对外暴露 schema 键
+    model_config = ConfigDict(populate_by_name=True)
+
+    schema_: str = Field(
+        alias="schema",
+        description="清单格式标识（当前固定 design-archive/v1）",
+    )
+    item_count: int = Field(
+        ..., description="清单内设计项数量（= 请求去重后的设计 ID 数）"
+    )
+    designs: dict[str, ArchiveDesignItemOut] = Field(
+        ...,
+        description="设计快照映射：键为设计 ID 字符串，按 ID 升序构造；"
+        "规范化序列化时键按字典序排序",
+    )
+
+
+class DesignArchiveOut(BaseModel):
+    """一次归档（新建或幂等复用）的结果。"""
+
+    id: int = Field(..., description="归档记录 ID")
+    digest: str = Field(
+        ..., description="规范化清单 JSON 的 SHA-256 hex digest（64 位小写）"
+    )
+    reused: bool = Field(
+        ...,
+        description="是否复用了已有归档：相同 digest 已存在时为 true（HTTP 200），"
+        "首次持久化为 false（HTTP 201）",
+    )
+    created_at: str = Field(
+        ..., description="归档记录创建时间（UTC，ISO 8601）；复用即首次创建时间"
+    )
+    design_ids: list[int] = Field(
+        ..., description="本归档覆盖的设计 ID，按升序"
+    )
+    item_count: int = Field(..., description="归档设计项数量")
+    manifest: DesignArchiveManifestOut = Field(..., description="规范化 JSON 清单")
+
+
+class DesignArchiveVerifyOut(BaseModel):
+    """归档核验结果：基于当前库中数据重新计算后与归档快照比对。"""
+
+    id: int = Field(..., description="被核验的归档记录 ID")
+    digest: str = Field(..., description="归档时持久化的 SHA-256 digest")
+    recomputed_digest: str | None = Field(
+        ...,
+        description="按当前库中数据重建清单并重算的 digest；有设计缺失、无法"
+        "重建完整清单时为 null",
+    )
+    digest_match: bool = Field(
+        ...,
+        description="重算 digest 与归档 digest 是否一致；有设计缺失时恒为 false"
+    )
+    missing_design_ids: list[int] = Field(
+        ...,
+        description="归档覆盖、但当前库中已读不到的设计 ID，按升序",
+    )
+    first_diff_path: str | None = Field(
+        ...,
+        description="归档清单与重算清单首个差异的点分路径"
+        "（如 designs.2.audit.exceeds；数组元素用 [i]）；无差异为 null",
+    )
+    verified_at: str = Field(
+        ..., description="本次核验时间（UTC，ISO 8601）"
     )
 
 

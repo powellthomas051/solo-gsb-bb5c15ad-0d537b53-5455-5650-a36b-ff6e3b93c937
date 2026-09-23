@@ -5,13 +5,16 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, Response
 
-from . import db, weave, wif
+from . import archives, db, weave, wif
 from .models import (
     AuditOut,
     BalanceHotspotsIn,
     BalanceHotspotsOut,
+    DesignArchiveIn,
+    DesignArchiveOut,
+    DesignArchiveVerifyOut,
     DesignCompareIn,
     DesignCompareOut,
     DesignIn,
@@ -49,6 +52,77 @@ app = FastAPI(
 @app.get("/health", tags=["meta"])
 def health() -> dict:
     return {"status": "ok"}
+
+
+@app.post(
+    "/design-archives",
+    response_model=DesignArchiveOut,
+    responses={
+        200: {
+            "model": DesignArchiveOut,
+            "description": "相同 digest 的归档已存在，幂等复用（reused=true）",
+        },
+        201: {
+            "model": DesignArchiveOut,
+            "description": "首次按该 digest 持久化归档成功（reused=false）",
+        },
+        404: {
+            "model": ErrorOut,
+            "description": "存在未入库的设计 ID，整次归档失败且不产生归档记录",
+        },
+    },
+    tags=["design-archives"],
+)
+def create_design_archive(request: DesignArchiveIn) -> Response:
+    """设计归档：接收 1～50 个已入库设计 ID（不重复，顺序无关），按 ID
+    升序读取每份设计的参数与审计结果，生成规范化 JSON 清单（canonical
+    JSON：固定字段、键排序、紧凑分隔符）并计算 SHA-256 digest 后持久化。
+    清单内容只取决于 ID 集合与当前入库内容，因此**相同 digest 幂等复用**：
+    已存在时直接返回原记录（200，`reused=true`、`id`/`created_at` 不变），
+    否则新建（201，`reused=false`）。任一 ID 未入库返回 404，整个请求失败、
+    **不产生半成品归档记录**。"""
+    try:
+        result, reused = archives.create_archive(request.design_ids)
+    except LookupError as exc:
+        first_missing, all_missing = exc.args
+        return JSONResponse(
+            status_code=404,
+            content={
+                "detail": f"design {first_missing} not found",
+                "missing_design_ids": all_missing,
+            },
+        )
+    return JSONResponse(
+        status_code=200 if reused else 201,
+        content=DesignArchiveOut.model_validate(result).model_dump(by_alias=True),
+    )
+
+
+@app.get(
+    "/design-archives/{id}/verify",
+    response_model=DesignArchiveVerifyOut,
+    responses={404: {"model": ErrorOut, "description": "归档不存在"}},
+    tags=["design-archives"],
+)
+def verify_design_archive(id: int) -> dict:
+    """归档核验：按归档记录中的设计 ID 列表重新从库中读取设计参数与审计
+    结果，重建规范化清单并重算 SHA-256 digest，与归档时持久化的 digest、
+    清单逐项比较。返回：
+
+    - `digest_match`：重算 digest 与归档 digest 是否一致；
+    - `missing_design_ids`：归档覆盖、当前库中已读不到的设计（升序）；
+    - `first_diff_path`：归档清单与重算清单**首个差异的点分路径**
+      （如 `designs.2.audit.exceeds`，数组元素用 `[i]`；缺失设计为
+      `designs.<id> (design missing from store)`），无差异为 `null`；
+    - `recomputed_digest`：重算 digest；有设计缺失、无法完整重建时为 `null`。
+
+    只读核验，不修改归档与原设计；归档 ID 不存在返回 404。"""
+    try:
+        return archives.verify_archive(id)
+    except db.ArchiveNotFoundError:
+        raise HTTPException(
+            status_code=404, detail=f"design archive {id} not found"
+        )
 
 
 def _audit_and_store(
