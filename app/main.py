@@ -4,14 +4,17 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import PlainTextResponse
 
-from . import db, weave, wif
+from . import archives, db, weave, wif
 from .models import (
     AuditOut,
     BalanceHotspotsIn,
     BalanceHotspotsOut,
+    DesignArchiveIn,
+    DesignArchiveOut,
+    DesignArchiveVerifyOut,
     DesignCompareIn,
     DesignCompareOut,
     DesignIn,
@@ -533,4 +536,109 @@ def loom_fit(design_id: int, request: LoomFitIn) -> dict:
             "treadling": reduction.treadling,
             "interlacing": reduction.interlacing,
         },
+    }
+
+
+def _archive_payload(record: dict, reused: bool) -> dict:
+    return {
+        "id": record["id"],
+        "digest": record["digest"],
+        "design_ids": record["design_ids"],
+        "design_count": record["design_count"],
+        "manifest": record["manifest"],
+        "reused": reused,
+        "created_at": record["created_at"],
+    }
+
+
+@app.post(
+    "/design-archives",
+    response_model=DesignArchiveOut,
+    responses={
+        200: {"model": DesignArchiveOut, "description": "命中相同 digest 的既有归档，幂等复用（未新增数据）"},
+        201: {"model": DesignArchiveOut, "description": "新建归档"},
+        400: {"model": ErrorOut, "description": "请求 ID 列表含重复项"},
+        404: {"model": ErrorOut, "description": "存在尚未入库的设计 ID，整次归档不写库"},
+    },
+    tags=["design-archives"],
+)
+def create_design_archive(request: DesignArchiveIn, response: Response) -> dict:
+    """设计归档：接收 1～50 个已入库设计 ID，**按 ID 升序去重**后在同一读取
+    流程中取出每份设计的参数与审计结果，生成规范化（键字典序、无空白、UTF-8）
+    JSON 清单（`design-archive-v1`），并计算其 SHA-256 摘要持久化。
+
+    - 列表含重复 ID 返回 **400**，不写库；存在未入库 ID 返回 **404**
+      （detail 列出全部缺失 ID），不写库——校验、读取全部成功后才执行唯一
+      一次写入，**归档失败不产生半成品**；
+    - 摘要相同（同一批设计、与提交顺序无关）**幂等复用**同一条归档记录，
+      返回 **200** 与 `reused=true`；首次归档返回 **201**、`reused=false`。
+    """
+    design_ids = sorted(set(request.design_ids))
+    if len(design_ids) != len(request.design_ids):
+        raise HTTPException(
+            status_code=400,
+            detail="design_ids must not contain duplicates",
+        )
+    stored = db.get_designs_many(design_ids)
+    missing = [
+        design_id for design_id, item in zip(design_ids, stored) if item is None
+    ]
+    if missing:
+        raise HTTPException(
+            status_code=404,
+            detail=f"designs not found: {', '.join(str(i) for i in missing)}",
+        )
+    manifest = archives.build_manifest(stored)  # type: ignore[arg-type]
+    manifest_text = archives.canonical_text(manifest)
+    digest = archives.digest_of(manifest)
+    record, reused = db.insert_archive_or_get(
+        digest=digest, design_ids=design_ids, manifest_text=manifest_text
+    )
+    # 复用既有归档返回 200，首次创建返回 201（状态码无法用单一 status_code
+    # 声明，这里显式设置）。
+    response.status_code = 200 if reused else 201
+    return _archive_payload(record, reused)
+
+
+@app.get(
+    "/design-archives/{archive_id}/verify",
+    response_model=DesignArchiveVerifyOut,
+    responses={404: {"model": ErrorOut, "description": "归档不存在"}},
+    tags=["design-archives"],
+)
+def verify_design_archive(archive_id: int) -> dict:
+    """归档完整性校验：按归档时记录的设计 ID 列表重新读取**当前**的设计参数
+    与审计结果，重建规范化清单并重算 SHA-256 摘要，与归档摘要比对。
+
+    - `consistent`：重算摘要与归档摘要一致且无缺失设计项时为 `true`；
+    - `missing_design_ids`：归档后被删除（或当前不存在）的设计 ID（升序）；
+    - `first_diff_path`：归档清单与当前内容的首个差异路径（JSON Pointer
+      风格，如 `/items/0/audit/exceeds`、`/design_count`），一致时为 `null`。
+    接口只读计算，不修改归档与设计。
+    """
+    record = db.get_archive(archive_id)
+    if record is None:
+        raise HTTPException(
+            status_code=404, detail=f"design archive {archive_id} not found"
+        )
+    design_ids = record["design_ids"]
+    current_rows = db.get_designs_many(design_ids)
+    missing = [
+        design_id
+        for design_id, item in zip(design_ids, current_rows)
+        if item is None
+    ]
+    present = [item for item in current_rows if item is not None]
+    current_manifest = archives.build_manifest(present)
+    recomputed = archives.digest_of(current_manifest)
+    stored_manifest = record["manifest"]
+    first_diff = archives.first_diff_path(stored_manifest, current_manifest)
+    consistent = recomputed == record["digest"] and not missing
+    return {
+        "archive_id": archive_id,
+        "digest": record["digest"],
+        "recomputed_digest": recomputed,
+        "consistent": consistent,
+        "missing_design_ids": missing,
+        "first_diff_path": first_diff,
     }

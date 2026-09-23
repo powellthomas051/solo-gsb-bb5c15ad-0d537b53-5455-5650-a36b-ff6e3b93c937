@@ -41,6 +41,15 @@ CREATE TABLE IF NOT EXISTS design_tags (
     created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
     UNIQUE (design_id, tag)
 );
+
+CREATE TABLE IF NOT EXISTS design_archives (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    digest       TEXT NOT NULL UNIQUE,          -- 清单规范化字节的 SHA-256 十六进制
+    design_ids   TEXT NOT NULL,                 -- JSON：升序去重的设计 ID
+    design_count INTEGER NOT NULL,
+    manifest     TEXT NOT NULL,                 -- 规范化 JSON 清单（canonical 文本）
+    created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+);
 """
 
 MAX_TAG_LENGTH = 32
@@ -56,6 +65,10 @@ class TagError(ValueError):
 
 class DuplicateTagError(ValueError):
     """同一设计下标签已存在。"""
+
+
+class ArchiveNotFoundError(LookupError):
+    """查询 / 校验归档时归档 ID 不存在。"""
 
 _lock = threading.Lock()
 
@@ -246,3 +259,93 @@ def list_design_tags(design_id: int) -> dict:
             "tags": tags,
             "count": len(tags),
         }
+
+
+def get_designs_many(design_ids: list[int]) -> list[dict | None]:
+    """在同一连接 / 同一读取快照内按给定顺序返回设计详情（结构与
+    get_design 一致）；缺失的 ID 对应位置为 None。用于归档前一次性读取
+    全部设计参数与审计结果，避免半读状态。"""
+    if not design_ids:
+        return []
+    with _lock, _connect() as conn:
+        results: list[dict | None] = []
+        for design_id in design_ids:
+            design = conn.execute(
+                "SELECT * FROM designs WHERE id = ?", (design_id,)
+            ).fetchone()
+            if design is None:
+                results.append(None)
+                continue
+            audit = conn.execute(
+                "SELECT * FROM audits WHERE design_id = ?", (design_id,)
+            ).fetchone()
+            results.append(_row_to_detail(design, audit))
+        return results
+
+
+def _archive_row_to_dict(row: sqlite3.Row) -> dict:
+    return {
+        "id": row["id"],
+        "digest": row["digest"],
+        "design_ids": json.loads(row["design_ids"]),
+        "design_count": row["design_count"],
+        "manifest": json.loads(row["manifest"]),
+        "manifest_text": row["manifest"],
+        "created_at": row["created_at"],
+    }
+
+
+def insert_archive_or_get(
+    *,
+    digest: str,
+    design_ids: list[int],
+    manifest_text: str,
+) -> tuple[dict, bool]:
+    """原子「按摘要查重 → 不存在则写入」。
+
+    清单与摘要在事务外已完整构建（所有设计均确认存在），本函数只做一次
+    写入，失败整体回滚，绝不产生半成品；digest 上有 UNIQUE 约束兜底：
+    并发请求命中同一摘要时，落败的 INSERT 抛 IntegrityError 后回读已存在
+    的归档。返回 (归档记录, reused)，reused=True 表示命中既有归档（幂等
+    复用，未新增数据）。
+    """
+    with _lock, _connect() as conn:
+        existing = conn.execute(
+            "SELECT * FROM design_archives WHERE digest = ?", (digest,)
+        ).fetchone()
+        if existing is not None:
+            return _archive_row_to_dict(existing), True
+        try:
+            cur = conn.execute(
+                """INSERT INTO design_archives
+                       (digest, design_ids, design_count, manifest)
+                   VALUES (?, ?, ?, ?)""",
+                (
+                    digest,
+                    json.dumps(design_ids),
+                    len(design_ids),
+                    manifest_text,
+                ),
+            )
+        except sqlite3.IntegrityError:
+            # 并发下另一请求已写入同一 digest：回读复用，本事务回滚。
+            conn.rollback()
+            raced = conn.execute(
+                "SELECT * FROM design_archives WHERE digest = ?", (digest,)
+            ).fetchone()
+            return _archive_row_to_dict(raced), True
+        row = conn.execute(
+            "SELECT * FROM design_archives WHERE id = ?", (cur.lastrowid,)
+        ).fetchone()
+        return _archive_row_to_dict(row), False
+
+
+def get_archive(archive_id: int) -> dict | None:
+    """按归档 ID 读取完整归档（含解析后的 manifest 与原始规范化文本）。"""
+    with _lock, _connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM design_archives WHERE id = ?", (archive_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        return _archive_row_to_dict(row)

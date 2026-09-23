@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, Strict, model_validator
+
+# 归档请求中的设计 ID：严格整数（拒绝 "1"、1.0 等宽松转换）且 ≥ 1。
+StrictDesignId = Annotated[int, Strict(), Field(ge=1)]
 
 
 class DesignIn(BaseModel):
@@ -443,4 +446,102 @@ class DesignCompareOut(BaseModel):
         ...,
         description="最佳对齐后的第二份交织矩阵（1=经纱在上，0=纬纱在上）："
         "aligned[h][w] = 原矩阵[(h + weft_offset) % 行数][(w + warp_offset) % 列数]",
+    )
+
+
+class DesignArchiveIn(BaseModel):
+    """设计归档请求：1～50 个已入库设计 ID（框架层校验数量与类型）。"""
+
+    design_ids: list[StrictDesignId] = Field(
+        ...,
+        min_length=1,
+        max_length=50,
+        description="待归档的已入库设计 ID，1～50 个（严格正整数）；服务端按 ID "
+        "升序去重读取，重复 ID 会被拒绝（400），缺失 ID 返回 404",
+    )
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [{"design_ids": [3, 1, 2]}]
+        }
+    }
+
+
+class ArchiveParametersOut(BaseModel):
+    """归档清单中一份设计的设计参数（不含 id / created_at 等入库元数据）。"""
+
+    name: str | None = Field(..., description="设计名称（可选）")
+    cyclic: bool = Field(..., description="纹样是否循环")
+    max_float: int = Field(..., description="入库时声明的最大浮长阈值")
+    shafts: int = Field(..., description="综框数（tie_up 列数）")
+    treadles: int = Field(..., description="踏板数（tie_up 行数）")
+    warp_ends: int = Field(..., description="经纱数（交织矩阵列数）")
+    weft_picks: int = Field(..., description="纬纱数（交织矩阵行数）")
+    threading: list[int]
+    tie_up: list[list[int]]
+    treadling: list[int]
+
+
+class ArchiveItemOut(BaseModel):
+    """归档清单中的一个设计项：设计 ID + 设计参数 + 审计结果。"""
+
+    design_id: int = Field(..., description="被归档的设计 ID")
+    parameters: ArchiveParametersOut
+    audit: AuditOut
+
+
+class ArchiveManifestOut(BaseModel):
+    """规范化设计归档清单（v1）：摘要即对此对象规范化字节流的 SHA-256。"""
+
+    format: Literal["design-archive-v1"] = Field(
+        ..., description="清单格式标识，当前固定为 design-archive-v1"
+    )
+    design_ids: list[int] = Field(
+        ..., description="归档的设计 ID，升序去重"
+    )
+    design_count: int = Field(..., description="归档设计数（design_ids 长度）")
+    items: list[ArchiveItemOut] = Field(
+        ..., description="逐项设计参数与审计结果，顺序与 design_ids 一致"
+    )
+
+
+class DesignArchiveOut(BaseModel):
+    """POST /design-archives 的归档结果。"""
+
+    id: int = Field(..., description="归档记录 ID")
+    digest: str = Field(
+        ..., description="清单规范化字节流的 SHA-256 十六进制摘要（64 位小写）"
+    )
+    design_ids: list[int] = Field(..., description="实际归档的设计 ID，升序去重")
+    design_count: int = Field(..., description="归档设计数")
+    manifest: ArchiveManifestOut = Field(..., description="规范化 JSON 清单全文")
+    reused: bool = Field(
+        ...,
+        description="是否幂等复用：true=命中相同 digest 的既有归档（HTTP 200，"
+        "未新增数据）；false=本次新建（HTTP 201）",
+    )
+    created_at: str = Field(..., description="首次归档时间（UTC，ISO 8601）")
+
+
+class DesignArchiveVerifyOut(BaseModel):
+    """GET /design-archives/{id}/verify 的完整性校验报告。"""
+
+    archive_id: int = Field(..., description="被校验的归档 ID")
+    digest: str = Field(..., description="归档时持久化的 SHA-256 摘要")
+    recomputed_digest: str = Field(
+        ...,
+        description="按归档 ID 列表重新读取当前设计参数与审计结果后重算的摘要",
+    )
+    consistent: bool = Field(
+        ...,
+        description="重算摘要与归档摘要是否一致（且无缺失设计项）"
+    )
+    missing_design_ids: list[int] = Field(
+        ...,
+        description="归档 ID 列表中当前已缺失（删除或不存在）的设计 ID，升序",
+    )
+    first_diff_path: str | None = Field(
+        ...,
+        description="归档清单与当前内容的首个差异路径（JSON Pointer 风格，根为"
+        " 空串）；一致（或仅摘要列被改动而清单仍一致）时为 null",
     )
